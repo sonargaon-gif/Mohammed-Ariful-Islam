@@ -1,0 +1,21 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+# If you host the Express + WebSocket + SQLite backend (`server.ts`) separately
+# (e.g., on Cloud Run, Render, or Railway), uncomment the rule below and replace
+# YOUR_BACKEND_URL with your live backend origin so `/api/*` requests proxy cleanly:
+# [[redirects]]
+#   from = "/api/*"
+#   to = "https://YOUR_BACKEND_URL/api/:splat"
+#   status = 200
+#   force = true
+
+# Single-Page Application fallback for client-side routes
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200

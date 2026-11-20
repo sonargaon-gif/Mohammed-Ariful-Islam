@@ -974,6 +974,7 @@ async function startServer(): Promise<void> {
         'tsconfig.json',
         'vite.config.ts',
         'metadata.json',
+        'netlify.toml',
         '.env.example',
         '.gitignore',
       ].filter((item) => fs.existsSync(path.join(rootDir, item)));
