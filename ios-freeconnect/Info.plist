@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDisplayName</key>
+    <string>FreeConnect</string>
+
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>FreeConnect uses Bluetooth Low Energy to discover nearby iPhone and Android devices and send 100% offline messages without internet or mobile data.</string>
+
+    <key>NSBluetoothPeripheralUsageDescription</key>
+    <string>FreeConnect advertises as a local Bluetooth peripheral so nearby iPhone and Android users can connect and chat completely offline.</string>
+
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>FreeConnect uses Apple MultipeerConnectivity peer-to-peer networking to send offline messages, voice notes, and files directly to nearby iPhones without internet.</string>
+
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_freeconnect._tcp</string>
+        <string>_freeconnect._udp</string>
+    </array>
+
+    <key>NSCameraUsageDescription</key>
+    <string>FreeConnect uses the camera to scan offline QR contact cards and QR pairing codes.</string>
+
+    <key>NSMicrophoneUsageDescription</key>
+    <string>FreeConnect uses the microphone to record offline voice messages.</string>
+
+    <key>UIBackgroundModes</key>
+    <array>
+        <string>bluetooth-central</string>
+        <string>bluetooth-peripheral</string>
+    </array>
+</dict>
+</plist>

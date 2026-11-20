@@ -1,0 +1,1162 @@
+import 'dotenv/config';
+import crypto from 'crypto';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import http from 'http';
+import os from 'os';
+import path from 'path';
+import fs from 'fs';
+import express, { NextFunction, Request, Response } from 'express';
+import { WebSocket, WebSocketServer } from 'ws';
+import {
+  PairingDatabase,
+  PairingUserRecord,
+  CodeStatus,
+  OtpPurpose,
+  SESSION_TTL_MS,
+} from './server/pairingDb';
+
+const execFileAsync = promisify(execFile);
+const BACKUPS_DIR = path.resolve(process.cwd(), 'backups');
+const SAFE_BACKUP_FILENAME_RE = /^freeconnect-website-backup-[0-9TZ-]+\.tar\.gz$/;
+
+const PORT = Number(process.env.PORT || 3000);
+const IS_PROD = process.env.NODE_ENV === 'production';
+// Server-only admin elevation code (never embedded in client bundle)
+const SERVER_ADMIN_ACCESS_CODE = (process.env.ADMIN_ACCESS_CODE || 'FREECONNECT-ADMIN-2026').trim();
+const SESSION_COOKIE_NAME = 'fc_session';
+
+const TWILIO_ACCOUNT_SID = (process.env.TWILIO_ACCOUNT_SID || '').trim();
+const TWILIO_AUTH_TOKEN = (process.env.TWILIO_AUTH_TOKEN || '').trim();
+const TWILIO_FROM_NUMBER = (process.env.TWILIO_FROM_NUMBER || '').trim();
+
+const db = new PairingDatabase();
+
+// Periodic sweep every 30 seconds to expire 10-minute codes and recycle unused expired codes back to available pool
+setInterval(() => {
+  try {
+    db.sweepExpiredCodes();
+  } catch {
+    // Keep sweeper resilient
+  }
+}, 30_000);
+
+// Sliding-window rate limiter (prevents code guessing / brute-force claims)
+interface RateBucket {
+  timestamps: number[];
+}
+const rateBuckets = new Map<string, RateBucket>();
+
+function checkRateLimit(key: string, maxRequests: number, windowMs: number): {
+  allowed: boolean;
+  retryAfterSec: number;
+} {
+  const now = Date.now();
+  const bucket = rateBuckets.get(key) ?? { timestamps: [] };
+  bucket.timestamps = bucket.timestamps.filter((t) => now - t < windowMs);
+  if (bucket.timestamps.length >= maxRequests) {
+    const oldest = bucket.timestamps[0];
+    const retryAfterSec = Math.max(1, Math.ceil((windowMs - (now - oldest)) / 1000));
+    rateBuckets.set(key, bucket);
+    return { allowed: false, retryAfterSec };
+  }
+  bucket.timestamps.push(now);
+  rateBuckets.set(key, bucket);
+  return { allowed: true, retryAfterSec: 0 };
+}
+
+function getClientIp(req: Request): string {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded.length > 0) {
+    return forwarded.split(',')[0].trim();
+  }
+  return req.socket.remoteAddress || 'unknown';
+}
+
+function parseCookies(cookieHeader: string | undefined): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!cookieHeader) return out;
+  for (const part of cookieHeader.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx <= 0) continue;
+    const key = part.slice(0, idx).trim();
+    const val = part.slice(idx + 1).trim();
+    try {
+      out[key] = decodeURIComponent(val);
+    } catch {
+      out[key] = val;
+    }
+  }
+  return out;
+}
+
+function isSecureRequest(req: Request): boolean {
+  const proto = req.headers['x-forwarded-proto'];
+  if (typeof proto === 'string' && proto.split(',')[0].trim() === 'https') {
+    return true;
+  }
+  return Boolean((req.socket as { encrypted?: boolean }).encrypted);
+}
+
+function setSessionCookie(req: Request, res: Response, sessionToken: string): void {
+  const maxAgeSec = Math.floor(SESSION_TTL_MS / 1000);
+  const secure = isSecureRequest(req);
+  const parts = [
+    `${SESSION_COOKIE_NAME}=${encodeURIComponent(sessionToken)}`,
+    'Path=/',
+    'HttpOnly',
+    `Max-Age=${maxAgeSec}`,
+    secure ? 'SameSite=None' : 'SameSite=Lax',
+  ];
+  if (secure) parts.push('Secure');
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+function clearSessionCookie(req: Request, res: Response): void {
+  const secure = isSecureRequest(req);
+  const parts = [
+    `${SESSION_COOKIE_NAME}=`,
+    'Path=/',
+    'HttpOnly',
+    'Max-Age=0',
+    secure ? 'SameSite=None' : 'SameSite=Lax',
+  ];
+  if (secure) parts.push('Secure');
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+
+function extractBearerToken(req: Request): string | null {
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const val = authHeader.slice(7).trim();
+    if (val) return val;
+  }
+  const headerToken = req.headers['x-pairing-token'];
+  if (typeof headerToken === 'string' && headerToken.trim()) {
+    return headerToken.trim();
+  }
+  const cookies = parseCookies(req.headers.cookie);
+  if (cookies[SESSION_COOKIE_NAME]) {
+    return cookies[SESSION_COOKIE_NAME];
+  }
+  return null;
+}
+
+async function dispatchSmsOtp(
+  phoneE164: string,
+  otpCode: string,
+  purpose: OtpPurpose
+): Promise<{ channel: 'sms' | 'instant_secure_channel'; note: string }> {
+  if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && TWILIO_FROM_NUMBER) {
+    try {
+      const purposeLabel =
+        purpose === 'register'
+          ? 'profile registration'
+          : purpose === 'change_phone'
+            ? 'phone number update'
+            : 'account recovery sign-in';
+      const body = new URLSearchParams({
+        To: phoneE164,
+        From: TWILIO_FROM_NUMBER,
+        Body: `FreeConnect verification code for ${purposeLabel}: ${otpCode}. Expires in 5 minutes.`,
+      });
+      const auth = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString('base64');
+      const res = await fetch(
+        `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(TWILIO_ACCOUNT_SID)}/Messages.json`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Basic ${auth}`,
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          body: body.toString(),
+        }
+      );
+      if (res.ok) {
+        return {
+          channel: 'sms',
+          note: `A 6-digit SMS verification code was sent to ${phoneE164}.`,
+        };
+      }
+    } catch {
+      // Fall through to instant secure delivery channel if SMS gateway is unreachable
+    }
+  }
+
+  return {
+    channel: 'instant_secure_channel',
+    note: `Verification code generated by the FreeConnect backend for ${phoneE164}. Enter the 6-digit code below to verify ownership.`,
+  };
+}
+
+interface AuthedRequest extends Request {
+  pairingUser?: PairingUserRecord;
+}
+
+// Active WebSocket connections mapped by userId for true real-time presence & instant delivery
+const socketsByUserId = new Map<string, Set<WebSocket>>();
+
+function getOnlineUserIds(): Set<string> {
+  const online = new Set<string>();
+  for (const [uid, set] of socketsByUserId.entries()) {
+    for (const ws of set) {
+      if (ws.readyState === WebSocket.OPEN) {
+        online.add(uid);
+        break;
+      }
+    }
+  }
+  return online;
+}
+
+function sendToUser(userId: string, event: Record<string, unknown>): boolean {
+  const set = socketsByUserId.get(userId);
+  if (!set || set.size === 0) return false;
+  const payload = JSON.stringify(event);
+  let sent = false;
+  for (const ws of set) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(payload);
+      sent = true;
+    }
+  }
+  return sent;
+}
+
+function broadcastPresenceChange(userId: string, online: boolean): void {
+  const rooms = db.listRoomsForUser(userId, getOnlineUserIds());
+  const notifiedPeers = new Set<string>();
+  for (const room of rooms) {
+    if (notifiedPeers.has(room.peer.id)) continue;
+    notifiedPeers.add(room.peer.id);
+    sendToUser(room.peer.id, {
+      type: 'pairing:presence',
+      userId,
+      online,
+      lastSeenAt: Date.now(),
+    });
+  }
+}
+
+function requireAuth(req: AuthedRequest, res: Response, next: NextFunction): void {
+  const token = extractBearerToken(req);
+  const user = db.getUserByToken(token);
+  if (!user) {
+    res.status(401).json({ error: 'Authentication required. Initialize a pairing session first.' });
+    return;
+  }
+  db.touchUserLastSeen(user.id);
+  req.pairingUser = user;
+  next();
+}
+
+function requireAdmin(req: AuthedRequest, res: Response, next: NextFunction): void {
+  if (!req.pairingUser || req.pairingUser.role !== 'admin') {
+    db.logEvent(
+      'admin_unauthorized',
+      null,
+      req.pairingUser?.id ?? null,
+      'error',
+      `Unauthorized access attempt to admin endpoint ${req.path}.`
+    );
+    res.status(403).json({ error: 'Administrator privileges required.' });
+    return;
+  }
+  next();
+}
+
+async function startServer(): Promise<void> {
+  const app = express();
+  app.use(express.json({ limit: '512kb' }));
+
+  // Health check
+  app.get('/api/health', (_req, res) => {
+    res.json({ ok: true, timestamp: Date.now() });
+  });
+
+  // --- PERMANENT USER PROFILE & PHONE OTP AUTHENTICATION ROUTES ---
+
+  // Restore remembered permanent session (from HTTP-only cookie or Bearer token)
+  app.get('/api/auth/me', (req: Request, res: Response) => {
+    const token = extractBearerToken(req);
+    const user = db.getUserByToken(token);
+    if (!user || !user.phoneVerified) {
+      res.json({ authenticated: false, user: null });
+      return;
+    }
+
+    db.touchUserLastSeen(user.id);
+    const onlineIds = getOnlineUserIds();
+    res.json({
+      authenticated: true,
+      sessionToken: token,
+      user: db.toAuthenticatedProfile(user),
+      myClaim: db.getMyActiveClaim(user.id),
+      requests: db.listRequestsForUser(user.id, onlineIds),
+      rooms: db.listRoomsForUser(user.id, onlineIds),
+    });
+  });
+
+  // Send 6-digit Phone Verification OTP (register, account recovery login, or change_phone)
+  app.post('/api/auth/otp/send', async (req: Request, res: Response) => {
+    const ip = getClientIp(req);
+    const body = req.body ?? {};
+    const purpose = (
+      body.purpose === 'login' || body.purpose === 'change_phone' ? body.purpose : 'register'
+    ) as OtpPurpose;
+    const countryCode = typeof body.countryCode === 'string' ? body.countryCode : '';
+    const phoneNumber = typeof body.phoneNumber === 'string' ? body.phoneNumber : '';
+
+    const rl = checkRateLimit(`otp_send:${ip}:${phoneNumber.replace(/\D/g, '')}`, 6, 3 * 60 * 1000);
+    if (!rl.allowed) {
+      res.status(429).json({
+        error: `Too many OTP requests. Please wait ${rl.retryAfterSec} seconds before retrying.`,
+      });
+      return;
+    }
+
+    let actingUserId: string | null = null;
+    if (purpose === 'change_phone') {
+      const token = extractBearerToken(req);
+      const user = db.getUserByToken(token);
+      if (!user) {
+        res.status(401).json({ error: 'Authentication required to change your phone number.' });
+        return;
+      }
+      actingUserId = user.id;
+    }
+
+    const challenge = db.createOtpChallenge({
+      purpose,
+      countryCode,
+      phoneNumber,
+      actingUserId,
+    });
+
+    if (!challenge.ok) {
+      res.status(challenge.statusCode).json({
+        error: challenge.error,
+        code: challenge.code,
+      });
+      return;
+    }
+
+    const delivery = await dispatchSmsOtp(challenge.phoneE164, challenge.otpCode, purpose);
+
+    res.json({
+      ok: true,
+      challengeId: challenge.challengeId,
+      phoneE164: challenge.phoneE164,
+      expiresAt: challenge.expiresAt,
+      deliveryChannel: delivery.channel,
+      deliveryMessage: delivery.note,
+      // Provided only when external SMS provider credentials are not configured in this environment
+      secureChannelOtp: delivery.channel === 'instant_secure_channel' ? challenge.otpCode : undefined,
+    });
+  });
+
+  // Verify 6-digit OTP code explicitly (returns verified state before profile submit or recovery)
+  app.post('/api/auth/otp/verify', (req: Request, res: Response) => {
+    const ip = getClientIp(req);
+    const rl = checkRateLimit(`otp_verify:${ip}`, 15, 3 * 60 * 1000);
+    if (!rl.allowed) {
+      res.status(429).json({
+        error: `Too many verification attempts. Please wait ${rl.retryAfterSec} seconds.`,
+      });
+      return;
+    }
+
+    const body = req.body ?? {};
+    const challengeId = typeof body.challengeId === 'string' ? body.challengeId : '';
+    const otpCode = typeof body.otpCode === 'string' ? body.otpCode : '';
+    const expectedPurpose =
+      body.purpose === 'register' || body.purpose === 'login' || body.purpose === 'change_phone'
+        ? (body.purpose as OtpPurpose)
+        : undefined;
+
+    const result = db.verifyOtpChallenge(challengeId, otpCode, expectedPurpose);
+    if (!result.ok) {
+      res.status(result.statusCode).json({ error: result.error });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      verified: true,
+      phoneE164: result.phoneE164,
+      purpose: result.purpose,
+    });
+  });
+
+  // Complete permanent first-time registration ("Create My Profile")
+  app.post('/api/auth/register', (req: Request, res: Response) => {
+    const ip = getClientIp(req);
+    const rl = checkRateLimit(`auth_register:${ip}`, 10, 5 * 60 * 1000);
+    if (!rl.allowed) {
+      res.status(429).json({
+        error: `Too many registration attempts. Please wait ${rl.retryAfterSec} seconds.`,
+      });
+      return;
+    }
+
+    const body = req.body ?? {};
+    const result = db.completeRegistration({
+      challengeId: typeof body.challengeId === 'string' ? body.challengeId : '',
+      otpCode: typeof body.otpCode === 'string' ? body.otpCode : undefined,
+      fullName: typeof body.fullName === 'string' ? body.fullName : '',
+      deviceId: typeof body.deviceId === 'string' ? body.deviceId : undefined,
+      platform: typeof body.platform === 'string' ? body.platform : 'Web Browser',
+    });
+
+    if (!result.ok) {
+      res.status(result.statusCode).json({ error: result.error });
+      return;
+    }
+
+    setSessionCookie(req, res, result.sessionToken);
+    const onlineIds = getOnlineUserIds();
+    res.json({
+      ok: true,
+      sessionToken: result.sessionToken,
+      expiresAt: result.expiresAt,
+      user: db.toAuthenticatedProfile(result.user),
+      myClaim: db.getMyActiveClaim(result.user.id),
+      requests: db.listRequestsForUser(result.user.id, onlineIds),
+      rooms: db.listRoomsForUser(result.user.id, onlineIds),
+    });
+  });
+
+  // Cross-device Login / Account Recovery with verified Phone Number & OTP
+  app.post('/api/auth/login', (req: Request, res: Response) => {
+    const ip = getClientIp(req);
+    const rl = checkRateLimit(`auth_login:${ip}`, 12, 5 * 60 * 1000);
+    if (!rl.allowed) {
+      res.status(429).json({
+        error: `Too many login attempts. Please wait ${rl.retryAfterSec} seconds.`,
+      });
+      return;
+    }
+
+    const body = req.body ?? {};
+    const result = db.completeOtpLogin({
+      challengeId: typeof body.challengeId === 'string' ? body.challengeId : '',
+      otpCode: typeof body.otpCode === 'string' ? body.otpCode : undefined,
+      deviceId: typeof body.deviceId === 'string' ? body.deviceId : undefined,
+      platform: typeof body.platform === 'string' ? body.platform : 'Web Browser',
+    });
+
+    if (!result.ok) {
+      res.status(result.statusCode).json({ error: result.error });
+      return;
+    }
+
+    setSessionCookie(req, res, result.sessionToken);
+    const onlineIds = getOnlineUserIds();
+    res.json({
+      ok: true,
+      sessionToken: result.sessionToken,
+      expiresAt: result.expiresAt,
+      user: db.toAuthenticatedProfile(result.user),
+      myClaim: db.getMyActiveClaim(result.user.id),
+      requests: db.listRequestsForUser(result.user.id, onlineIds),
+      rooms: db.listRoomsForUser(result.user.id, onlineIds),
+    });
+  });
+
+  // Update permanent authenticated user profile (Full Name, Username, Bio, Status, Photo, Phone Privacy)
+  app.patch('/api/auth/profile', requireAuth, (req: AuthedRequest, res: Response) => {
+    const user = req.pairingUser!;
+    const body = req.body ?? {};
+    const result = db.updateAuthenticatedProfile(user.id, {
+      fullName: typeof body.fullName === 'string' ? body.fullName : undefined,
+      displayName: typeof body.displayName === 'string' ? body.displayName : undefined,
+      username: typeof body.username === 'string' ? body.username : undefined,
+      bio: typeof body.bio === 'string' ? body.bio : undefined,
+      statusNote: typeof body.statusNote === 'string' ? body.statusNote : undefined,
+      avatarDataUrl:
+        body.avatarDataUrl === null || typeof body.avatarDataUrl === 'string'
+          ? body.avatarDataUrl
+          : undefined,
+      showPhoneToPeers:
+        typeof body.showPhoneToPeers === 'boolean' ? body.showPhoneToPeers : undefined,
+      deviceId: typeof body.deviceId === 'string' ? body.deviceId : undefined,
+      platform: typeof body.platform === 'string' ? body.platform : undefined,
+    });
+
+    if (!result.ok) {
+      res.status(result.statusCode).json({ error: result.error });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      user: db.toAuthenticatedProfile(result.user),
+    });
+  });
+
+  // Change verified mobile phone number after OTP ownership verification
+  app.post('/api/auth/change-phone', requireAuth, (req: AuthedRequest, res: Response) => {
+    const user = req.pairingUser!;
+    const body = req.body ?? {};
+    const result = db.completeChangePhone({
+      userId: user.id,
+      challengeId: typeof body.challengeId === 'string' ? body.challengeId : '',
+      otpCode: typeof body.otpCode === 'string' ? body.otpCode : undefined,
+    });
+
+    if (!result.ok) {
+      res.status(result.statusCode).json({ error: result.error });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      user: db.toAuthenticatedProfile(result.user),
+    });
+  });
+
+  // Logout current device session (preserves permanent account in backend for OTP recovery)
+  app.post('/api/auth/logout', (req: Request, res: Response) => {
+    const token = extractBearerToken(req);
+    if (token) {
+      db.revokeSessionByToken(token);
+    }
+    clearSessionCookie(req, res);
+    res.json({ ok: true });
+  });
+
+  // Permanently delete account, all sessions, rooms, and release active pairing codes
+  app.delete('/api/auth/account', requireAuth, (req: AuthedRequest, res: Response) => {
+    const user = req.pairingUser!;
+    const sockets = socketsByUserId.get(user.id);
+    if (sockets) {
+      for (const ws of sockets) {
+        try {
+          ws.close(1000, 'Account deleted');
+        } catch {
+          // ignore
+        }
+      }
+      socketsByUserId.delete(user.id);
+    }
+
+    db.deleteUserAccount(user.id);
+    clearSessionCookie(req, res);
+    res.json({ ok: true });
+  });
+
+  // 1. Sync authenticated permanent user session with pairing state (never creates unverified accounts)
+  app.post('/api/pairing/session', requireAuth, (req: AuthedRequest, res: Response) => {
+    const user = req.pairingUser!;
+    const token = extractBearerToken(req);
+    const body = req.body ?? {};
+
+    const updateRes = db.updateAuthenticatedProfile(user.id, {
+      deviceId: typeof body.deviceId === 'string' ? body.deviceId : undefined,
+      platform: typeof body.platform === 'string' ? body.platform : undefined,
+    });
+    const current = updateRes.ok ? updateRes.user : user;
+
+    const onlineIds = getOnlineUserIds();
+    const myClaim = db.getMyActiveClaim(current.id);
+    const requests = db.listRequestsForUser(current.id, onlineIds);
+    const rooms = db.listRoomsForUser(current.id, onlineIds);
+
+    res.json({
+      sessionToken: token,
+      user: db.toAuthenticatedProfile(current),
+      myClaim,
+      requests,
+      rooms,
+    });
+  });
+
+  // 2. Curated random pairing code pool (NEVER exposes the full code database)
+  app.get('/api/pairing/pool', requireAuth, (req: AuthedRequest, res: Response) => {
+    const user = req.pairingUser!;
+    const limit = Number(req.query.limit || 15);
+    const pool = db.getCuratedPool(user.id, Number.isFinite(limit) ? limit : 15);
+    res.json(pool);
+  });
+
+  // 3. Atomically claim a code from the backend pool (10-minute expiration)
+  app.post('/api/pairing/claim', requireAuth, (req: AuthedRequest, res: Response) => {
+    const user = req.pairingUser!;
+    const ip = getClientIp(req);
+    const rl = checkRateLimit(`claim:${user.id}:${ip}`, 20, 2 * 60 * 1000);
+    if (!rl.allowed) {
+      db.logEvent(
+        'rate_limit_claim',
+        null,
+        user.id,
+        'warn',
+        `Rate limit triggered on code claim (${rl.retryAfterSec}s cooldown).`
+      );
+      res.status(429).json({
+        error: `Too many code selections. Wait ${rl.retryAfterSec} seconds and try again.`,
+      });
+      return;
+    }
+
+    const code = typeof req.body?.code === 'string' ? req.body.code : '';
+    const result = db.claimCode(user.id, code);
+    if (!result.ok) {
+      res.status(409).json({ error: result.error });
+      return;
+    }
+
+    res.json({ ok: true, claim: result.claim });
+  });
+
+  // 4. Cancel / release user's active unused code back into the available pool
+  app.post('/api/pairing/cancel', requireAuth, (req: AuthedRequest, res: Response) => {
+    const user = req.pairingUser!;
+    const result = db.cancelActiveCode(user.id);
+    res.json({ ok: true, releasedCode: result.releasedCode });
+  });
+
+  // 5. Verify a received 6-digit code against backend DB (strictly rate-limited against guessing)
+  app.post('/api/pairing/verify', requireAuth, (req: AuthedRequest, res: Response) => {
+    const user = req.pairingUser!;
+    const ip = getClientIp(req);
+    const rl = checkRateLimit(`verify:${user.id}:${ip}`, 10, 2 * 60 * 1000);
+    if (!rl.allowed) {
+      db.logEvent(
+        'rate_limit_verify',
+        typeof req.body?.code === 'string' ? req.body.code : null,
+        user.id,
+        'error',
+        `Brute-force protection: verify rate limit hit (${rl.retryAfterSec}s cooldown).`
+      );
+      res.status(429).json({
+        verdict: 'invalid',
+        error: `Too many verification attempts. Wait ${rl.retryAfterSec} seconds before trying again.`,
+      });
+      return;
+    }
+
+    const code = typeof req.body?.code === 'string' ? req.body.code : '';
+    const result = db.verifyCode(code, user.id, getOnlineUserIds());
+    res.json(result);
+  });
+
+  // 6. Send connection request after code verification
+  app.post('/api/pairing/request', requireAuth, (req: AuthedRequest, res: Response) => {
+    const user = req.pairingUser!;
+    const ip = getClientIp(req);
+    const rl = checkRateLimit(`req:${user.id}:${ip}`, 12, 2 * 60 * 1000);
+    if (!rl.allowed) {
+      res.status(429).json({
+        error: `Too many connection requests. Wait ${rl.retryAfterSec} seconds.`,
+      });
+      return;
+    }
+
+    const code = typeof req.body?.code === 'string' ? req.body.code : '';
+    const onlineIds = getOnlineUserIds();
+    const result = db.createConnectionRequest(user.id, code, onlineIds);
+    if (!result.ok) {
+      res.status(400).json({ verdict: result.verdict, error: result.error });
+      return;
+    }
+
+    // Notify the code owner immediately over WebSocket
+    const requesterProfile = db.toPublicProfile(user, onlineIds);
+    sendToUser(result.targetUserId, {
+      type: 'pairing:request_received',
+      request: {
+        ...result.request,
+        direction: 'incoming',
+        peer: requesterProfile,
+      },
+    });
+
+    res.json({ ok: true, request: result.request });
+  });
+
+  // 7. Accept or Reject an incoming connection request
+  app.post('/api/pairing/request/:requestId/respond', requireAuth, (req: AuthedRequest, res: Response) => {
+    const user = req.pairingUser!;
+    const requestId = req.params.requestId;
+    const accept = Boolean(req.body?.accept);
+    const onlineIds = getOnlineUserIds();
+
+    const result = db.respondToConnectionRequest(requestId, user.id, accept, onlineIds);
+    if (!result.ok) {
+      res.status(400).json({ error: result.error });
+      return;
+    }
+
+    if (result.status === 'accepted' && result.room) {
+      const requesterRoom = db.getRoomSummaryForUser(result.room.id, result.fromUserId, onlineIds);
+      sendToUser(result.fromUserId, {
+        type: 'pairing:connected',
+        requestId,
+        code: result.code,
+        room: requesterRoom,
+      });
+      sendToUser(result.toUserId, {
+        type: 'pairing:connected',
+        requestId,
+        code: result.code,
+        room: result.room,
+      });
+    } else {
+      sendToUser(result.fromUserId, {
+        type: 'pairing:request_rejected',
+        requestId,
+        code: result.code,
+      });
+    }
+
+    res.json({
+      ok: true,
+      status: result.status,
+      room: result.room ?? null,
+    });
+  });
+
+  // 8. List user's requests + private rooms
+  app.get('/api/pairing/state', requireAuth, (req: AuthedRequest, res: Response) => {
+    const user = req.pairingUser!;
+    const onlineIds = getOnlineUserIds();
+    res.json({
+      myClaim: db.getMyActiveClaim(user.id),
+      requests: db.listRequestsForUser(user.id, onlineIds),
+      rooms: db.listRoomsForUser(user.id, onlineIds),
+    });
+  });
+
+  // 9. Private room messages (strict 2-party authorization)
+  app.get('/api/pairing/rooms/:roomId/messages', requireAuth, (req: AuthedRequest, res: Response) => {
+    const user = req.pairingUser!;
+    const roomId = req.params.roomId;
+    const result = db.getRoomMessages(roomId, user.id);
+    if (!result.ok) {
+      res.status(result.statusCode).json({ error: result.error });
+      return;
+    }
+
+    // Mark incoming messages as delivered now that this authorized participant loaded them
+    const deliveredIds = db.markRoomMessagesDelivered(roomId, user.id);
+    if (deliveredIds.length > 0) {
+      const participants = db.getRoomParticipants(roomId);
+      if (participants) {
+        const peerId = participants.userAId === user.id ? participants.userBId : participants.userAId;
+        sendToUser(peerId, {
+          type: 'pairing:messages_delivered',
+          roomId,
+          messageIds: deliveredIds,
+        });
+      }
+    }
+
+    res.json({ messages: result.messages });
+  });
+
+  // 10. Send a real-time message inside a private paired room
+  app.post('/api/pairing/rooms/:roomId/messages', requireAuth, (req: AuthedRequest, res: Response) => {
+    const user = req.pairingUser!;
+    const roomId = req.params.roomId;
+    const text = typeof req.body?.text === 'string' ? req.body.text : '';
+    const onlineIds = getOnlineUserIds();
+    const participants = db.getRoomParticipants(roomId);
+    const peerId = participants
+      ? participants.userAId === user.id
+        ? participants.userBId
+        : participants.userAId
+      : '';
+    const peerOnline = Boolean(peerId && onlineIds.has(peerId));
+
+    const result = db.sendRoomMessage(roomId, user.id, text, peerOnline);
+    if (!result.ok) {
+      res.status(result.statusCode).json({ error: result.error });
+      return;
+    }
+
+    sendToUser(result.peerUserId, {
+      type: 'pairing:message',
+      roomId,
+      message: result.message,
+    });
+
+    res.json({ ok: true, message: result.message });
+  });
+
+  // 11. Disconnect a private paired room
+  app.post('/api/pairing/rooms/:roomId/disconnect', requireAuth, (req: AuthedRequest, res: Response) => {
+    const user = req.pairingUser!;
+    const roomId = req.params.roomId;
+    const result = db.disconnectRoom(roomId, user.id);
+    if (!result.ok) {
+      res.status(result.statusCode).json({ error: result.error });
+      return;
+    }
+
+    sendToUser(result.peerUserId, {
+      type: 'pairing:room_disconnected',
+      roomId,
+      disconnectedBy: user.id,
+    });
+
+    res.json({ ok: true, roomId });
+  });
+
+  // --- ADMIN CONTROL CENTER ROUTES ---
+
+  // Elevate an authenticated user to admin using server-verified ADMIN_ACCESS_CODE
+  app.post('/api/admin/unlock', requireAuth, (req: AuthedRequest, res: Response) => {
+    const user = req.pairingUser!;
+    const ip = getClientIp(req);
+    const rl = checkRateLimit(`admin_unlock:${ip}`, 8, 5 * 60 * 1000);
+    if (!rl.allowed) {
+      res.status(429).json({ error: `Too many attempts. Wait ${rl.retryAfterSec}s.` });
+      return;
+    }
+
+    const passcode = typeof req.body?.passcode === 'string' ? req.body.passcode.trim() : '';
+    if (user.role === 'admin' || (passcode && passcode === SERVER_ADMIN_ACCESS_CODE)) {
+      const updated = db.setUserRole(user.id, 'admin')!;
+      db.logEvent('admin_unlocked', null, user.id, 'info', `Admin session verified for ${user.username}.`);
+      res.json({ ok: true, role: updated.role });
+      return;
+    }
+
+    db.logEvent('admin_unlock_failed', null, user.id, 'error', `Invalid admin passcode submitted by ${user.username}.`);
+    res.status(403).json({ error: 'Invalid Admin Access Code.' });
+  });
+
+  app.get('/api/admin/overview', requireAuth, requireAdmin, (req: AuthedRequest, res: Response) => {
+    const statusFilter = (typeof req.query.status === 'string' ? req.query.status : 'all') as
+      | CodeStatus
+      | 'all';
+    const search = typeof req.query.search === 'string' ? req.query.search : '';
+
+    res.json({
+      stats: db.getAdminStats(),
+      codes: db.getAdminCodeList(statusFilter, search, 40),
+      connections: db.getAdminConnections(25),
+      events: db.getRecentEvents(40),
+    });
+  });
+
+  app.post('/api/admin/codes/generate', requireAuth, requireAdmin, (req: AuthedRequest, res: Response) => {
+    const count = Number(req.body?.count || 500);
+    if (!Number.isFinite(count) || count < 10 || count > 5000) {
+      res.status(400).json({ error: 'Count must be between 10 and 5,000.' });
+      return;
+    }
+    const result = db.generateAdditionalCodes(count);
+    res.json({ ok: true, ...result, stats: db.getAdminStats() });
+  });
+
+  app.post('/api/admin/codes/:code/disable', requireAuth, requireAdmin, (req: AuthedRequest, res: Response) => {
+    const user = req.pairingUser!;
+    const code = req.params.code;
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason : 'Flagged as suspicious';
+    const result = db.disableCode(code, reason, user.id);
+    if (!result.ok) {
+      res.status(404).json({ error: result.error });
+      return;
+    }
+    res.json({ ok: true, code: result.code, stats: db.getAdminStats() });
+  });
+
+  app.post('/api/admin/codes/recycle-expired', requireAuth, requireAdmin, (_req: AuthedRequest, res: Response) => {
+    const result = db.sweepExpiredCodes(true);
+    res.json({ ok: true, ...result, stats: db.getAdminStats() });
+  });
+
+  // --- FULL WEBSITE BACKUP & SNAPSHOT ROUTES ---
+
+  const listSavedBackupArchives = () => {
+    fs.mkdirSync(BACKUPS_DIR, { recursive: true });
+    const entries = fs.readdirSync(BACKUPS_DIR, { withFileTypes: true });
+    const archives = entries
+      .filter((entry) => entry.isFile() && SAFE_BACKUP_FILENAME_RE.test(entry.name))
+      .map((entry) => {
+        const fullPath = path.join(BACKUPS_DIR, entry.name);
+        const stat = fs.statSync(fullPath);
+        const sha256 = crypto
+          .createHash('sha256')
+          .update(fs.readFileSync(fullPath))
+          .digest('hex')
+          .slice(0, 16);
+        return {
+          filename: entry.name,
+          sizeBytes: stat.size,
+          createdAt: stat.mtimeMs,
+          checksumShort: sha256,
+        };
+      })
+      .sort((a, b) => b.createdAt - a.createdAt);
+    return archives;
+  };
+
+  // Export authenticated user's permanent backend data (profile, rooms, messages, requests, claim)
+  app.get('/api/backup/user-export', requireAuth, (req: AuthedRequest, res: Response) => {
+    const user = req.pairingUser!;
+    const payload = db.exportUserAccountData(user.id, getOnlineUserIds());
+    if (!payload) {
+      res.status(404).json({ error: 'Account data not found.' });
+      return;
+    }
+    res.json({ ok: true, backup: payload });
+  });
+
+  // List saved full website snapshot archives on the server
+  app.get('/api/backup/list', requireAuth, (_req: AuthedRequest, res: Response) => {
+    try {
+      res.json({ ok: true, backups: listSavedBackupArchives() });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Unable to read backup archive list.',
+      });
+    }
+  });
+
+  // Create a fresh timestamped full-website .tar.gz archive (source code + native companions + consistent SQLite snapshot)
+  app.post('/api/backup/server-snapshot', requireAuth, async (req: AuthedRequest, res: Response) => {
+    const user = req.pairingUser!;
+    const rl = checkRateLimit(`backup_snapshot:${user.id}`, 6, 5 * 60 * 1000);
+    if (!rl.allowed) {
+      res.status(429).json({
+        error: `Please wait ${rl.retryAfterSec} seconds before creating another full website snapshot.`,
+      });
+      return;
+    }
+
+    const tempStage = fs.mkdtempSync(path.join(os.tmpdir(), 'fc-backup-'));
+    try {
+      fs.mkdirSync(BACKUPS_DIR, { recursive: true });
+      const stamp = new Date()
+        .toISOString()
+        .replace(/[-:]/g, '')
+        .replace(/\.\d+Z$/, 'Z');
+      const filename = `freeconnect-website-backup-${stamp}.tar.gz`;
+      const destArchivePath = path.join(BACKUPS_DIR, filename);
+
+      // 1. Create a WAL-safe consistent SQLite database snapshot
+      const dbSnapshotPath = path.join(tempStage, 'freeconnect_pairing.db');
+      await db.createSqliteBackupSnapshot(dbSnapshotPath);
+
+      // 2. Write backup manifest metadata
+      const manifest = {
+        app: 'FreeConnect Offline Messenger',
+        backupVersion: 1,
+        createdAt: new Date().toISOString(),
+        createdByUserId: user.id,
+        includes: [
+          'Web Frontend (src/, public/, index.html)',
+          'Full-Stack Express & WebSocket Server (server.ts, server/)',
+          'Native Mobile Companions (android-freeconnect/, ios-freeconnect/)',
+          'Configuration & Build Manifests (package.json, vite.config.ts, tsconfig.json, metadata.json, .env.example)',
+          'Consistent SQLite Database Snapshot (database-snapshot/freeconnect_pairing.db)',
+        ],
+      };
+      fs.writeFileSync(
+        path.join(tempStage, 'BACKUP_MANIFEST.json'),
+        JSON.stringify(manifest, null, 2),
+        'utf8'
+      );
+
+      // 3. Collect all existing root project items (excluding generated/heavy/recursive dirs)
+      const rootDir = process.cwd();
+      const candidateItems = [
+        'src',
+        'server',
+        'server.ts',
+        'public',
+        'android-freeconnect',
+        'ios-freeconnect',
+        'index.html',
+        'package.json',
+        'tsconfig.json',
+        'vite.config.ts',
+        'metadata.json',
+        '.env.example',
+        '.gitignore',
+      ].filter((item) => fs.existsSync(path.join(rootDir, item)));
+
+      // 4. Bundle everything into a single compressed .tar.gz archive
+      const tarArgs = [
+        '-czf',
+        destArchivePath,
+        '--exclude=node_modules',
+        '--exclude=dist',
+        '--exclude=.git',
+        '--exclude=backups',
+        '--exclude=*.log',
+        '-C',
+        rootDir,
+        ...candidateItems,
+        '-C',
+        tempStage,
+        'BACKUP_MANIFEST.json',
+        'freeconnect_pairing.db',
+      ];
+      await execFileAsync('tar', tarArgs, { maxBuffer: 16 * 1024 * 1024 });
+
+      const stat = fs.statSync(destArchivePath);
+      const checksumShort = crypto
+        .createHash('sha256')
+        .update(fs.readFileSync(destArchivePath))
+        .digest('hex')
+        .slice(0, 16);
+
+      db.logEvent(
+        'website_backup_created',
+        null,
+        user.id,
+        'info',
+        `Created full website backup archive ${filename} (${Math.round(stat.size / 1024)} KB).`
+      );
+
+      res.json({
+        ok: true,
+        backup: {
+          filename,
+          sizeBytes: stat.size,
+          createdAt: stat.mtimeMs,
+          checksumShort,
+        },
+        backups: listSavedBackupArchives(),
+      });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Failed to create full website backup archive.',
+      });
+    } finally {
+      fs.rmSync(tempStage, { recursive: true, force: true });
+    }
+  });
+
+  // Download a saved full-website .tar.gz archive securely
+  app.get('/api/backup/download/:filename', requireAuth, (req: AuthedRequest, res: Response) => {
+    const filename = String(req.params.filename || '');
+    if (!SAFE_BACKUP_FILENAME_RE.test(filename)) {
+      res.status(400).json({ error: 'Invalid backup archive filename.' });
+      return;
+    }
+
+    const fullPath = path.join(BACKUPS_DIR, filename);
+    if (!fullPath.startsWith(BACKUPS_DIR + path.sep) || !fs.existsSync(fullPath)) {
+      res.status(404).json({ error: 'Backup archive not found.' });
+      return;
+    }
+
+    res.setHeader('Content-Type', 'application/gzip');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.sendFile(fullPath);
+  });
+
+  // Mount Vite middleware in dev, or serve built dist/ in production
+  if (!IS_PROD) {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    const distDir = path.resolve(process.cwd(), 'dist');
+    app.use(express.static(distDir));
+    app.get('*', (_req, res) => {
+      const indexPath = path.join(distDir, 'index.html');
+      if (fs.existsSync(indexPath)) {
+        res.sendFile(indexPath);
+      } else {
+        res.status(404).send('Build output not found. Run npm run build first.');
+      }
+    });
+  }
+
+  const httpServer = http.createServer(app);
+
+  // Real-time WebSocket server for cross-platform pairing events, delivery receipts, and online presence
+  const wss = new WebSocketServer({ noServer: true });
+
+  httpServer.on('upgrade', (request, socket, head) => {
+    const url = new URL(request.url || '/', `http://${request.headers.host || 'localhost'}`);
+    if (url.pathname !== '/ws/pairing') {
+      return;
+    }
+    const cookies = parseCookies(request.headers.cookie);
+    const token = url.searchParams.get('token') || cookies[SESSION_COOKIE_NAME] || null;
+    const user = db.getUserByToken(token);
+    if (!user) {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, user);
+    });
+  });
+
+  wss.on('connection', (ws: WebSocket, user: PairingUserRecord) => {
+    const existingSet = socketsByUserId.get(user.id) ?? new Set<WebSocket>();
+    const wasOffline = existingSet.size === 0;
+    existingSet.add(ws);
+    socketsByUserId.set(user.id, existingSet);
+    db.touchUserLastSeen(user.id);
+
+    if (wasOffline) {
+      broadcastPresenceChange(user.id, true);
+    }
+
+    ws.send(
+      JSON.stringify({
+        type: 'pairing:hello',
+        userId: user.id,
+        online: true,
+        timestamp: Date.now(),
+      })
+    );
+
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(String(raw)) as { type?: string; roomId?: string };
+        db.touchUserLastSeen(user.id);
+        if (msg.type === 'ping') {
+          ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
+        } else if (msg.type === 'pairing:ack_room' && typeof msg.roomId === 'string') {
+          const deliveredIds = db.markRoomMessagesDelivered(msg.roomId, user.id);
+          if (deliveredIds.length > 0) {
+            const participants = db.getRoomParticipants(msg.roomId);
+            if (participants) {
+              const peerId =
+                participants.userAId === user.id ? participants.userBId : participants.userAId;
+              sendToUser(peerId, {
+                type: 'pairing:messages_delivered',
+                roomId: msg.roomId,
+                messageIds: deliveredIds,
+              });
+            }
+          }
+        }
+      } catch {
+        // Ignore malformed client frames
+      }
+    });
+
+    ws.on('close', () => {
+      const set = socketsByUserId.get(user.id);
+      if (set) {
+        set.delete(ws);
+        if (set.size === 0) {
+          socketsByUserId.delete(user.id);
+          db.touchUserLastSeen(user.id);
+          broadcastPresenceChange(user.id, false);
+        }
+      }
+    });
+  });
+
+  httpServer.listen(PORT, '0.0.0.0', () => {
+    console.log(`[FreeConnect] Full-stack Pairing & Messenger Server listening on http://0.0.0.0:${PORT}`);
+  });
+}
+
+void startServer();

@@ -1,0 +1,17 @@
+<resources>
+    <string name="app_name">FreeConnect</string>
+    <string name="tagline">تطبيق مراسلة بدون إنترنت ١٠٠٪</string>
+    <string name="subtitle_connect">تواصل • دردش • شارك — بدون إنترنت</string>
+    <string name="slogan">ابقَ متصلاً... دائماً!</string>
+    <string name="start_connecting">ابدأ الاتصال</string>
+    <string name="nav_chats">المحادثات</string>
+    <string name="nav_connect">اتصال</string>
+    <string name="nav_network">الشبكة</string>
+    <string name="nav_files">الملفات</string>
+    <string name="nav_contacts">جهات الاتصال</string>
+    <string name="nav_profile">الملف الشخصي</string>
+    <string name="sos_title">طوارئ SOS</string>
+    <string name="sos_trigger">بث نداء استغاثة عبر البلوتوث</string>
+    <string name="service_channel_name">مرحّل بلوتوث FreeConnect</string>
+    <string name="service_channel_desc">يحافظ على اتصال البلوتوث ونقل الرسائل دون إنترنت.</string>
+</resources>

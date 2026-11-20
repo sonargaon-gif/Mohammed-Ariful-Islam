@@ -1,0 +1,87 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-display: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "DM Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  html {
+    font-family: var(--font-sans);
+    scroll-behavior: smooth;
+  }
+
+  h1, h2, h3, h4 {
+    font-family: var(--font-display);
+  }
+
+  code, pre, .font-mono {
+    font-family: var(--font-mono);
+  }
+}
+
+@keyframes signalPulse {
+  0%, 100% {
+    opacity: 0.45;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.9;
+    transform: scale(1.05);
+  }
+}
+
+@keyframes dashFlow {
+  to {
+    stroke-dashoffset: -28;
+  }
+}
+
+@keyframes particleDrift {
+  0%, 100% {
+    opacity: 0.25;
+    transform: translate3d(0, 0, 0);
+  }
+  50% {
+    opacity: 0.72;
+    transform: translate3d(0, -14px, 0);
+  }
+}
+
+.fc-signal-wave {
+  animation: signalPulse 3.6s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+
+.fc-link-flow {
+  stroke-dasharray: 7 7;
+  animation: dashFlow 1.4s linear infinite;
+}
+
+.fc-particle {
+  animation: particleDrift 6.5s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .fc-signal-wave,
+  .fc-link-flow,
+  .fc-particle {
+    animation: none;
+  }
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(56, 189, 248, 0.25);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(34, 211, 238, 0.55);
+}

@@ -1,0 +1,17 @@
+<resources>
+    <string name="app_name">FreeConnect</string>
+    <string name="tagline">100% ऑफ़लाइन मैसेंजर</string>
+    <string name="subtitle_connect">जुड़ें • चैट • शेयर — बिना इंटरनेट</string>
+    <string name="slogan">हमेशा जुड़े रहें!</string>
+    <string name="start_connecting">कनेक्ट शुरू करें</string>
+    <string name="nav_chats">चैट</string>
+    <string name="nav_connect">कनेक्ट</string>
+    <string name="nav_network">नेटवर्क</string>
+    <string name="nav_files">फ़ाइलें</string>
+    <string name="nav_contacts">संपर्क</string>
+    <string name="nav_profile">प्रोफ़ाइल</string>
+    <string name="sos_title">आपातकालीन SOS</string>
+    <string name="sos_trigger">ब्लूटूथ SOS प्रसारित करें</string>
+    <string name="service_channel_name">FreeConnect ब्लूटूथ रिले</string>
+    <string name="service_channel_desc">ऑफ़लाइन ब्लूटूथ संदेश और मेश रिले सक्रिय रखता है।</string>
+</resources>
